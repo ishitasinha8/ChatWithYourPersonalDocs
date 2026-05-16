@@ -1,0 +1,9 @@
+Ishita — Software Engineer
+
+Experience:
+- Built Python CLI tools for document search and retrieval-augmented generation.
+- Worked with OpenAI embeddings and chat APIs for question answering over personal files.
+
+Skills: Python, OpenAI API, RAG, argparse, pypdf.
+
+Education: Computer Science.
