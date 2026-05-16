@@ -256,6 +256,14 @@ def answer_from_chunks(client: OpenAI, question: str, retrieved: list[Chunk]) ->
     return response.choices[0].message.content or ""
 
 
+def cannot_answer_from_docs(answer: str) -> bool:
+    lower = answer.lower()
+    return any(
+        phrase in lower
+        for phrase in ("cannot answer", "not contain", "not in the documents")
+    )
+
+
 def print_keyword_debug(question: str, matches: list[Chunk]) -> None:
     print(f"Question: {question}")
     print()
@@ -331,6 +339,10 @@ def main() -> None:
 
     print("Answer:")
     print(answer)
+
+    if cannot_answer_from_docs(answer):
+        return
+
     print()
     print("Sources:")
     if not sources:
