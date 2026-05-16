@@ -6,6 +6,7 @@ Expects OPENAI_API_KEY in the environment or in a .env file (loaded via python-d
 
 import argparse
 import os
+import pickle
 import re
 import sys
 from dataclasses import dataclass
@@ -22,11 +23,12 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf"}
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 TOP_K = 5
-SOURCE_SCORE_RATIO = 0.75
+SOURCE_SCORE_RATIO = 0.85
 EMBED_BATCH_SIZE = 100
 PREVIEW_LENGTH = 120
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
+CACHE_FILENAME = ".embeddings_cache.pkl"
 PLACEHOLDER_API_KEYS = frozenset({"your_key_here", "sk-your-key-here"})
 
 STOPWORDS = frozenset({"the", "is", "what", "and", "of", "in"})
@@ -51,19 +53,80 @@ class ScoredChunk:
     score: float
 
 
+@dataclass
+class AskResult:
+    answer: str
+    sources: list[ScoredChunk]
+    retrieved: list[ScoredChunk]
+
+
 def die(message: str) -> None:
     print(f"Error: {message}", file=sys.stderr)
     sys.exit(1)
 
 
-def require_api_key() -> str:
+def get_api_key() -> str:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key or api_key.lower() in PLACEHOLDER_API_KEYS:
-        die(
+        raise ValueError(
             "OPENAI_API_KEY is not set or is still a placeholder. "
             "Set it in .env or your environment."
         )
     return api_key
+
+
+def require_api_key() -> str:
+    try:
+        return get_api_key()
+    except ValueError as exc:
+        die(str(exc))
+    raise AssertionError("unreachable")
+
+
+def resolve_folder(folder_input: str) -> Path:
+    folder_input = folder_input.strip()
+    if not folder_input:
+        raise ValueError("folder_path cannot be empty.")
+    folder = Path(folder_input).expanduser().resolve()
+    if not folder.exists():
+        raise ValueError(f"Folder not found: {folder}")
+    if not folder.is_dir():
+        raise ValueError(f"Not a directory: {folder}")
+    return folder
+
+
+def resolve_question(question: str) -> str:
+    question = question.strip()
+    if not question:
+        raise ValueError("question cannot be empty.")
+    return question
+
+
+def build_chunks(folder: Path) -> list[Chunk]:
+    docs = load_documents(folder)
+    if not docs:
+        raise ValueError(
+            f"No supported documents found in {folder}. "
+            f"Add .txt, .md, or .pdf files and try again."
+        )
+
+    all_chunks: list[Chunk] = []
+    for doc in docs:
+        all_chunks.extend(chunk_text(doc.text, doc.filename))
+
+    if not all_chunks:
+        raise ValueError(f"Documents in {folder} contain no chunkable text.")
+    return all_chunks
+
+
+def ask_question(
+    client: OpenAI, folder: Path, all_chunks: list[Chunk], question: str
+) -> AskResult:
+    scored_retrieved = retrieve_chunks_embedding(client, folder, all_chunks, question)
+    sources = relevant_sources(scored_retrieved)
+    context_chunks = [item.chunk for item in scored_retrieved]
+    answer = answer_from_chunks(client, question, context_chunks)
+    return AskResult(answer=answer, sources=sources, retrieved=scored_retrieved)
 
 
 def clean_text(text: str) -> str:
@@ -180,6 +243,100 @@ def embed_texts(client: OpenAI, texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
+def log_info(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def cache_path(folder: Path) -> Path:
+    return folder / CACHE_FILENAME
+
+
+def load_embedding_cache(folder: Path) -> dict:
+    path = cache_path(folder)
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as handle:
+            return pickle.load(handle)
+    except (OSError, pickle.PickleError) as exc:
+        log_info(f"Warning: could not load embedding cache: {exc}")
+        return {}
+
+
+def save_embedding_cache(folder: Path, cache: dict) -> None:
+    path = cache_path(folder)
+    with path.open("wb") as handle:
+        pickle.dump(cache, handle)
+
+
+def group_chunks_by_file(chunks: list[Chunk]) -> dict[str, list[Chunk]]:
+    grouped: dict[str, list[Chunk]] = {}
+    for chunk in chunks:
+        grouped.setdefault(chunk.filename, []).append(chunk)
+    for file_chunks in grouped.values():
+        file_chunks.sort(key=lambda item: item.chunk_index)
+    return grouped
+
+
+def get_chunk_embeddings(
+    client: OpenAI, folder: Path, chunks: list[Chunk]
+) -> list[list[float]]:
+    cache = load_embedding_cache(folder)
+    grouped = group_chunks_by_file(chunks)
+    new_cache: dict = {}
+    embedding_by_key: dict[tuple[str, int], list[float]] = {}
+
+    used_cache = False
+    recomputed_files: list[str] = []
+
+    for filename, file_chunks in grouped.items():
+        file_path = folder / filename
+        mtime = file_path.stat().st_mtime
+        signature = [(chunk.chunk_index, chunk.text) for chunk in file_chunks]
+
+        entry = cache.get(filename)
+        if entry and entry.get("modified_timestamp") == mtime:
+            cached_chunks = entry.get("chunks", [])
+            cached_signature = [
+                (item["chunk_index"], item["chunk_text"]) for item in cached_chunks
+            ]
+            if cached_signature == signature:
+                for item in cached_chunks:
+                    embedding_by_key[(filename, item["chunk_index"])] = item["embedding"]
+                new_cache[filename] = entry
+                used_cache = True
+                continue
+
+        embeddings = embed_texts(client, [chunk.text for chunk in file_chunks])
+        new_cache[filename] = {
+            "file_path": filename,
+            "modified_timestamp": mtime,
+            "chunks": [
+                {
+                    "chunk_index": chunk.chunk_index,
+                    "chunk_text": chunk.text,
+                    "embedding": embedding,
+                }
+                for chunk, embedding in zip(file_chunks, embeddings)
+            ],
+        }
+        for chunk, embedding in zip(file_chunks, embeddings):
+            embedding_by_key[(filename, chunk.chunk_index)] = embedding
+        recomputed_files.append(filename)
+
+    save_embedding_cache(folder, new_cache)
+
+    if used_cache and not recomputed_files:
+        log_info("Loaded embeddings from cache")
+    if recomputed_files:
+        log_info(
+            "Recomputed embeddings for changed files: "
+            + ", ".join(sorted(recomputed_files))
+        )
+
+    return [embedding_by_key[(chunk.filename, chunk.chunk_index)] for chunk in chunks]
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     vec_a = np.array(a, dtype=np.float64)
     vec_b = np.array(b, dtype=np.float64)
@@ -192,12 +349,13 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def retrieve_chunks_embedding(
     client: OpenAI,
+    folder: Path,
     chunks: list[Chunk],
     question: str,
     top_k: int = TOP_K,
 ) -> list[ScoredChunk]:
     try:
-        chunk_embeddings = embed_texts(client, [chunk.text for chunk in chunks])
+        chunk_embeddings = get_chunk_embeddings(client, folder, chunks)
         question_embedding = embed_texts(client, [question])[0]
     except APIError as exc:
         die(f"OpenAI embedding request failed: {exc}")
@@ -220,7 +378,8 @@ def relevant_sources(
     if top_score <= 0:
         return scored_chunks[:1]
     threshold = top_score * ratio
-    return [item for item in scored_chunks if item.score >= threshold]
+    filtered = [item for item in scored_chunks if item.score >= threshold]
+    return filtered or [scored_chunks[0]]
 
 
 def answer_from_chunks(client: OpenAI, question: str, retrieved: list[Chunk]) -> str:
@@ -291,38 +450,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    folder_input = args.folder_path.strip()
-    if not folder_input:
-        die("folder_path cannot be empty.")
-
-    question = args.question.strip()
-    if not question:
-        die("question cannot be empty.")
-
-    folder = Path(folder_input).expanduser().resolve()
-    if not folder.exists():
-        die(f"Folder not found: {folder}")
-    if not folder.is_dir():
-        die(f"Not a directory: {folder}")
+    try:
+        folder = resolve_folder(args.folder_path)
+        question = resolve_question(args.question)
+    except ValueError as exc:
+        die(str(exc))
 
     if not args.keyword:
         api_key = require_api_key()
     else:
         api_key = ""
 
-    docs = load_documents(folder)
-    if not docs:
-        die(
-            f"No supported documents found in {folder}. "
-            f"Add .txt, .md, or .pdf files and try again."
-        )
-
-    all_chunks: list[Chunk] = []
-    for doc in docs:
-        all_chunks.extend(chunk_text(doc.text, doc.filename))
-
-    if not all_chunks:
-        die(f"Documents in {folder} contain no chunkable text.")
+    try:
+        all_chunks = build_chunks(folder)
+    except ValueError as exc:
+        die(str(exc))
 
     if args.keyword:
         matches = retrieve_chunks_keyword(all_chunks, question)
@@ -330,29 +472,21 @@ def main() -> None:
         return
 
     client = OpenAI(api_key=api_key)
-    scored_retrieved = retrieve_chunks_embedding(client, all_chunks, question)
-    sources = relevant_sources(scored_retrieved)
-    context_chunks = [item.chunk for item in sources] or [
-        item.chunk for item in scored_retrieved
-    ]
-    answer = answer_from_chunks(client, question, context_chunks)
+    result = ask_question(client, folder, all_chunks, question)
 
     print("Answer:")
-    print(answer)
+    print(result.answer)
 
-    if cannot_answer_from_docs(answer):
+    if cannot_answer_from_docs(result.answer):
         return
 
     print()
     print("Sources:")
-    if not sources:
-        print("(none above confidence threshold)")
-    else:
-        for item in sources:
-            line = f"- {item.chunk.filename} (chunk {item.chunk.chunk_index})"
-            if args.debug:
-                line += f"  [score: {item.score:.4f}]"
-            print(line)
+    for item in result.sources:
+        line = f"- {item.chunk.filename} (chunk {item.chunk.chunk_index})"
+        if args.debug:
+            line += f"  [score: {item.score:.4f}]"
+        print(line)
 
 
 if __name__ == "__main__":
