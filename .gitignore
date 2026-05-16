@@ -27,3 +27,6 @@ build/
 
 # Local scratch / test folders
 test_docs_empty/
+
+# Embedding cache
+.embeddings_cache.pkl
